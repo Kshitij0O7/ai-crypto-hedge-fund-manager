@@ -1,0 +1,10 @@
+# Bitquery API Configuration
+BITQUERY_API_KEY=your-api-key-here
+
+# Google Gemini API Configuration (for AI-powered trading decisions)
+GEMINI_API_KEY=your-gemini-api-key-here
+
+# Trading Configuration (Optional)
+STARTING_CAPITAL=100000
+MONITORING_INTERVAL=30000
+

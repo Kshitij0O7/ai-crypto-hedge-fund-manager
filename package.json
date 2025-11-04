@@ -1,0 +1,23 @@
+{
+  "name": "crypto-hedge-fund",
+  "version": "1.0.0",
+  "description": "Terminal-based crypto hedge fund manager with Bitquery API integration",
+  "main": "index.js",
+  "type": "module",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "keywords": [
+    "crypto",
+    "hedge-fund",
+    "trading",
+    "bitquery",
+    "volatility",
+    "terminal"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "dotenv": "^17.2.3"
+  }
+}
