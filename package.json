@@ -1,7 +1,7 @@
 {
   "name": "crypto-hedge-fund",
   "version": "1.0.0",
-  "description": "Terminal-based crypto hedge fund manager with Bitquery API integration",
+  "description": "Terminal-based AI Crypto Hedge Fund Manager with Bitquery API integration",
   "main": "index.js",
   "type": "module",
   "scripts": {
@@ -9,11 +9,27 @@
   },
   "keywords": [
     "crypto",
+    "hedge",
+    "hedging",
     "hedge-fund",
+    "hedge-funds",
+    "crypto-hedge-fund",
+    "crypto-hedge-funds",
+    "hedge-fund-manager",
+    "crypto-hedge-fund-manager",
+    "ai",
+    "ai-hedge-fund",
+    "ai-hedge-funds",
+    "crypto-ai-hedge-fund",
+    "crypto-ai-hedge-funds",
     "trading",
+    "automated-trading",
+    "cryptocurrency-trading",
     "bitquery",
     "volatility",
-    "terminal"
+    "terminal",
+    "gemini-ai",
+    "trading-bot"
   ],
   "author": "",
   "license": "MIT",
