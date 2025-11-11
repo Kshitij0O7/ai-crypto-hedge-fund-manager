@@ -100,7 +100,7 @@ export class BitqueryClient {
         query MyQuery {
           Trading {
             Currencies(
-              where: {Currency: {Id: {in: "${currencyId}"}}, Interval: {Time: {Duration: {eq: 3600}}}, Block: {Time: {since_relative: {hours_ago: ${hoursAgo}}}}}
+              where: {Currency: {Id: {is: "${currencyId}"}}, Interval: {Time: {Duration: {eq: 3600}}}, Block: {Time: {since_relative: {hours_ago: ${hoursAgo}}}}}
               orderBy: {ascending: Interval_Time_Start}
             ) {
               Price {
@@ -155,6 +155,7 @@ export class BitqueryClient {
       }
       
       const result = await response.json();
+      console.log(result);
       
       if (result.errors) {
         Logger.error('Bitquery API errors:', result.errors);
