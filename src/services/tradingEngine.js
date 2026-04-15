@@ -1,402 +1,383 @@
 /**
- * Trading decision engine that analyzes data and makes trading decisions
+ * Agentic trading engine powered by Claude
+ * Uses tool-use to let Claude autonomously fetch data and make trading decisions
  */
 
+import { readFileSync } from 'fs';
+import { dirname, join } from 'path';
+import { fileURLToPath } from 'url';
+import Anthropic from '@anthropic-ai/sdk';
 import { Logger } from '../utils/logger.js';
-import { getStrategy } from '../strategies/baseStrategy.js';
+import { BitqueryClient } from './bitquery.js';
+
+const __dirname = dirname(fileURLToPath(import.meta.url));
+
+/**
+ * Load the trading strategy skill from .claude/skills/trading-strategy/SKILL.md
+ * Strips YAML frontmatter and returns the markdown content as the system prompt.
+ */
+function loadTradingSkill() {
+  const skillPath = join(__dirname, '../../.claude/skills/trading-strategy/SKILL.md');
+  const raw = readFileSync(skillPath, 'utf-8');
+  // Strip YAML frontmatter (between --- markers)
+  const parts = raw.split('---');
+  if (parts.length >= 3) {
+    return parts.slice(2).join('---').trim();
+  }
+  return raw.trim();
+}
+
+// Tool definitions for the Claude agent
+const TOOLS = [
+  {
+    name: 'get_market_data',
+    description: 'Fetch OHLC, volume, and SMA market data for a trading pair from Bitquery. Returns the latest hourly candle plus historical data. Use this to analyze price action before making trading decisions.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        pair: {
+          type: 'string',
+          enum: ['BTC', 'ETH', 'SOL'],
+          description: 'The trading pair symbol to fetch data for (quoted against USDT)'
+        },
+        hours_ago: {
+          type: 'number',
+          description: 'Number of hours of historical data to fetch (default: 24)',
+          default: 24
+        }
+      },
+      required: ['pair']
+    }
+  },
+  {
+    name: 'get_portfolio_status',
+    description: 'View the current portfolio including open positions, available capital, allocated capital, and P&L for each position.',
+    input_schema: {
+      type: 'object',
+      properties: {},
+      required: []
+    }
+  },
+  {
+    name: 'open_position',
+    description: 'Open a new long or short position on a trading pair. Capital will be allocated based on risk parameters.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        pair: {
+          type: 'string',
+          enum: ['BTC', 'ETH', 'SOL'],
+          description: 'The trading pair to open a position on'
+        },
+        position_type: {
+          type: 'string',
+          enum: ['long', 'short'],
+          description: 'Whether to go long (expecting price increase) or short (expecting price decrease)'
+        },
+        reasoning: {
+          type: 'string',
+          description: 'Brief explanation for why this position is being opened'
+        }
+      },
+      required: ['pair', 'position_type', 'reasoning']
+    }
+  },
+  {
+    name: 'close_position',
+    description: 'Close an existing open position on a trading pair. Will calculate P&L based on current market price.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        pair: {
+          type: 'string',
+          enum: ['BTC', 'ETH', 'SOL'],
+          description: 'The trading pair to close the position on'
+        },
+        reasoning: {
+          type: 'string',
+          description: 'Brief explanation for why this position is being closed'
+        }
+      },
+      required: ['pair', 'reasoning']
+    }
+  }
+];
 
 export class TradingEngine {
-  constructor(riskProfile = 'low', geminiApiKey = null) {
-    this.riskProfile = riskProfile;
-    this.geminiApiKey = geminiApiKey;
-    this.positions = new Map(); // Map<tokenAddress, Position>
+  constructor(anthropicApiKey = null) {
+    this.anthropicApiKey = anthropicApiKey;
+    this.client = anthropicApiKey ? new Anthropic({ apiKey: anthropicApiKey }) : null;
+    this.positions = new Map(); // Map<pair, Position>
     this.capital = 100000; // Starting capital in USD
     this.allocatedCapital = 0;
-    
-    // Risk parameters based on profile
-    this.riskParams = this.getRiskParameters(riskProfile);
-  }
+    this.bitqueryClient = null; // Set externally
+    this.systemPrompt = loadTradingSkill();
 
-  /**
-   * Get risk parameters based on selected profile
-   */
-  getRiskParameters(profile) {
-    const profiles = {
-      low: {
-        maxPositionSize: 0.1, // 10% of capital per position
-        volatilityThreshold: 0.02, // 2% volatility
-        stopLoss: 0.95, // 5% stop loss
-        takeProfit: 1.05 // 5% take profit
-      },
-      high: {
-        maxPositionSize: 0.3, // 30% of capital per position
-        volatilityThreshold: 0.05, // 5% volatility
-        stopLoss: 0.90, // 10% stop loss
-        takeProfit: 1.15 // 15% take profit
-      }
+    // Hedge fund risk parameters — conservative by design
+    this.riskParams = {
+      maxPositionSize: 0.1,   // 10% of capital per position
+      stopLoss: 0.95,         // 5% stop loss
+      takeProfit: 1.08        // 8% take profit
     };
-    
-    return profiles[profile] || profiles.low;
-  }
-
-
-
-  /**
-   * AI-powered: Analyze multiple currencies with a single Gemini API call
-   * @param {Array} currenciesWithMetrics - Array of {currencyId, volatilityData, tradeMetrics}
-   * @returns {Promise<Array>} Array of decision objects
-   */
-  async analyzeMultipleWithAI(currenciesWithMetrics) {
-    Logger.info(`Gemini analyzing ${currenciesWithMetrics.length} currencies in a single API call`);
-    
-    if (!this.geminiApiKey) {
-      Logger.warn('Gemini API key not provided, using fallback logic');
-      return currenciesWithMetrics.map(({ currencyId, volatilityData, tradeMetrics }) =>
-        this.fallbackDecision(currencyId, volatilityData, tradeMetrics)
-      );
-    }
-    
-    try {
-      // Build prompt with all currencies
-      const prompt = this.buildMultiCurrencyPrompt(currenciesWithMetrics);
-      
-      // Call Gemini API
-      const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-001:generateContent?key=${this.geminiApiKey}`;
-      const response = await fetch(apiUrl, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json'
-        },
-        body: JSON.stringify({
-          contents: [{
-            parts: [{
-              text: `You are an expert crypto trading assistant. Analyze the provided currencies and return trading decisions in JSON format. 
-For each currency, respond with one of: OPEN LONG, OPEN SHORT, CLOSE, or HOLD.
-Return a JSON array with objects containing: currencyId, action, positionType (long/short/null), and reasoning.
-
-${prompt}`
-            }]
-          }],
-          generationConfig: {
-            temperature: 0.3,
-            maxOutputTokens: 2000,
-            responseMimeType: 'application/json'
-          }
-        })
-      });
-      
-      // Check if response is OK
-      if (!response.ok) {
-        const errorText = await response.text();
-        let errorData;
-        try {
-          errorData = JSON.parse(errorText);
-        } catch (e) {
-          errorData = { message: errorText };
-        }
-        Logger.error(`Gemini API HTTP Error ${response.status}: ${JSON.stringify(errorData, null, 2)}`);
-        return currenciesWithMetrics.map(({ currencyId, volatilityData, tradeMetrics }) =>
-          this.fallbackDecision(currencyId, volatilityData, tradeMetrics)
-        );
-      }
-      
-      const data = await response.json();
-      
-      // Check for API errors in response
-      if (data.error) {
-        Logger.error(`Gemini API error: ${JSON.stringify(data.error, null, 2)}`);
-        return currenciesWithMetrics.map(({ currencyId, volatilityData, tradeMetrics }) =>
-          this.fallbackDecision(currencyId, volatilityData, tradeMetrics)
-        );
-      }
-      
-      // Validate response structure
-      if (!data.candidates || !data.candidates[0] || !data.candidates[0].content || !data.candidates[0].content.parts || !data.candidates[0].content.parts[0]) {
-        Logger.error(`Gemini API invalid response structure: ${JSON.stringify(data, null, 2)}`);
-        return currenciesWithMetrics.map(({ currencyId, volatilityData, tradeMetrics }) =>
-          this.fallbackDecision(currencyId, volatilityData, tradeMetrics)
-        );
-      }
-      
-      // Extract text from Gemini response
-      const responseText = data.candidates[0].content.parts[0].text;
-      
-      // Parse multi-currency response
-      const decisions = this.parseMultiCurrencyResponse(
-        responseText,
-        currenciesWithMetrics
-      );
-      
-      return decisions;
-      
-    } catch (error) {
-      Logger.error(`Gemini API call failed: ${error.message}`);
-      Logger.error(`Error stack: ${error.stack}`);
-      return currenciesWithMetrics.map(({ currencyId, volatilityData, tradeMetrics }) =>
-        this.fallbackDecision(currencyId, volatilityData, tradeMetrics)
-      );
-    }
   }
 
   /**
-   * Build prompt with strategy and trading metrics for multiple currencies
+   * Set the Bitquery client for data fetching
    */
-  buildMultiCurrencyPrompt(currenciesWithMetrics) {
-    const strategy = getStrategy(this.riskProfile);
-    let prompt = `${strategy}\n\n`;
-    prompt += `Analyze the following ${currenciesWithMetrics.length} currencies and provide trading decisions:\n\n`;
-    
-    currenciesWithMetrics.forEach(({ currencyId, volatilityData, tradeMetrics }, index) => {
-      const num = index + 1;
-      prompt += `--- CURRENCY ${num} ---\n`;
-      prompt += `Currency ID: ${currencyId}\n`;
-      prompt += `Volatility: ${volatilityData.volatility?.toFixed(2) ?? '0.00'}%\n`;
-      prompt += `Average Price: ${volatilityData.average?.toFixed(6) ?? '0.000000'} USD\n`;
-      
-      if (Array.isArray(tradeMetrics) && tradeMetrics.length > 0) {
-        const latestMetric = tradeMetrics[tradeMetrics.length - 1];
-        const ohlc = latestMetric.Price?.Ohlc || {};
-        const average = latestMetric.Price?.Average || {};
-        const volume = latestMetric.Volume || {};
-        
-        prompt += `OHLC: Open=${(ohlc.Open ?? 0).toFixed(6)}, High=${(ohlc.High ?? 0).toFixed(6)}, Low=${(ohlc.Low ?? 0).toFixed(6)}, Close=${(ohlc.Close ?? 0).toFixed(6)}\n`;
-        prompt += `Price Estimate: ${(average.Estimate ?? ohlc.Close ?? 0).toFixed(6)} USD\n`;
-        prompt += `Weighted SMA: ${(average.WeightedSimpleMoving ?? average.Estimate ?? ohlc.Close ?? 0).toFixed(6)} USD\n`;
-        prompt += `Volume (USD): ${(volume.Usd ?? 0).toFixed(2)} USD\n`;
-      } else {
-        prompt += `Metrics: Not available\n`;
-      }
-      prompt += '\n';
+  setBitqueryClient(client) {
+    this.bitqueryClient = client;
+  }
+
+  /**
+   * Run a full trading cycle using Claude's agentic loop
+   * Claude will autonomously fetch data, analyze, and make trading decisions
+   */
+  async runTradingCycle() {
+    if (!this.client) {
+      Logger.error('Anthropic API key not configured');
+      throw new Error('Anthropic API key required for trading');
+    }
+
+    if (!this.bitqueryClient) {
+      throw new Error('Bitquery client not set. Call setBitqueryClient() first.');
+    }
+
+    const pairs = BitqueryClient.getSupportedPairs();
+
+    const userMessage = `Analyze the current market conditions for ${pairs.join(', ')} (all quoted against USDT) and make trading decisions.
+
+Start by fetching market data for each pair, then check the current portfolio, and finally make your trading decisions (open, close, or hold positions).
+
+Available capital: $${(this.capital - this.allocatedCapital).toFixed(2)} of $${this.capital.toFixed(2)} total.`;
+
+    Logger.info('Starting Claude agentic trading cycle...');
+
+    const messages = [{ role: 'user', content: userMessage }];
+
+    // Agentic loop: keep calling Claude until it stops requesting tools
+    let response = await this.client.messages.create({
+      model: 'claude-sonnet-4-20250514',
+      max_tokens: 4096,
+      system: this.systemPrompt,
+      tools: TOOLS,
+      messages
     });
-    
-    prompt += `\nReturn your decisions as a JSON array. Example format:\n`;
-    prompt += `[\n`;
-    prompt += `  {"currencyId": "bid:solana:XXX", "action": "OPEN LONG", "positionType": "long", "reasoning": "Strong bullish trend"},\n`;
-    prompt += `  {"currencyId": "bid:solana:YYY", "action": "HOLD", "positionType": null, "reasoning": "Waiting for confirmation"}\n`;
-    prompt += `]\n`;
-    
-    return prompt;
-  }
 
-  /**
-   * Parse multi-currency Gemini response into array of decisions
-   */
-  parseMultiCurrencyResponse(gptText, currenciesWithMetrics) {
-    const decisions = [];
-    
-    try {
-      // Try to extract JSON from the response
-      const jsonMatch = gptText.match(/\[[\s\S]*\]/);
-      if (jsonMatch) {
-        const jsonData = JSON.parse(jsonMatch[0]);
-        
-        // Create a map for quick lookup
-        const decisionMap = new Map();
-        jsonData.forEach(item => {
-          if (item.currencyId) {
-            decisionMap.set(item.currencyId, item);
-          }
-        });
-        
-        // Match decisions to currencies
-        currenciesWithMetrics.forEach(({ currencyId, volatilityData, tradeMetrics }) => {
-          const item = decisionMap.get(currencyId);
-          if (item) {
-            const action = item.action?.toUpperCase() || 'HOLD';
-            let decision = 'hold';
-            
-            // Parse action more flexibly
-            if (action.includes('OPEN')) {
-              decision = 'open';
-            } else if (action.includes('CLOSE')) {
-              decision = 'close';
-            }
-            
-            // Determine position type from action or item.positionType
-            let type = 'long';
-            if (item.positionType) {
-              type = item.positionType.toLowerCase();
-            } else if (action.includes('SHORT')) {
-              type = 'short';
-            } else if (action.includes('LONG')) {
-              type = 'long';
-            }
-            
-            const latestMetric = tradeMetrics[tradeMetrics.length - 1];
-            const entryPrice = latestMetric?.Price?.Average?.Estimate || latestMetric?.Price?.Ohlc?.Close || 0;
-            
-            decisions.push({
-              currencyId,
-              decision,
-              positionType: type,
-              confidence: 0.7,
-              reasoning: item.reasoning || 'Market analysis completed',
-              entryPrice
-            });
-          } else {
-            // Fallback if currency not found in response
-            decisions.push(this.fallbackDecision(currencyId, volatilityData, tradeMetrics));
-          }
-        });
-      } else {
-        throw new Error('No JSON array found in response');
+    const actions = []; // Track actions for display
+
+    while (response.stop_reason === 'tool_use') {
+      const toolUseBlocks = response.content.filter(b => b.type === 'tool_use');
+      const textBlocks = response.content.filter(b => b.type === 'text');
+
+      // Display any text Claude outputs
+      for (const text of textBlocks) {
+        if (text.text.trim()) {
+          console.log(`\n🤖 ${text.text}`);
+        }
       }
-    } catch (error) {
-      Logger.warn(`Failed to parse Gemini multi-currency response: ${error.message}, using fallback`);
-      // Fallback to individual parsing or fallback decisions
-      return currenciesWithMetrics.map(({ currencyId, volatilityData, tradeMetrics }) =>
-        this.fallbackDecision(currencyId, volatilityData, tradeMetrics)
-      );
+
+      // Process each tool call
+      const toolResults = [];
+      for (const toolUse of toolUseBlocks) {
+        console.log(`\n🔧 Calling tool: ${toolUse.name}(${JSON.stringify(toolUse.input)})`);
+
+        const result = await this._executeTool(toolUse.name, toolUse.input);
+        actions.push({ tool: toolUse.name, input: toolUse.input, result });
+
+        toolResults.push({
+          type: 'tool_result',
+          tool_use_id: toolUse.id,
+          content: JSON.stringify(result)
+        });
+      }
+
+      // Feed results back to Claude
+      messages.push({ role: 'assistant', content: response.content });
+      messages.push({ role: 'user', content: toolResults });
+
+      response = await this.client.messages.create({
+        model: 'claude-sonnet-4-20250514',
+        max_tokens: 4096,
+        system: this.systemPrompt,
+        tools: TOOLS,
+        messages
+      });
     }
-    
-    return decisions;
+
+    // Display Claude's final analysis
+    const finalText = response.content
+      .filter(b => b.type === 'text')
+      .map(b => b.text)
+      .join('\n');
+
+    if (finalText.trim()) {
+      console.log(`\n📊 Claude's Analysis:\n${finalText}`);
+    }
+
+    return { actions, summary: finalText };
   }
 
   /**
-   * Fallback decision logic if Gemini API fails
+   * Execute a tool call from Claude
+   * @private
    */
-  fallbackDecision(currencyId, volatilityData, tradeMetrics) {
-    // Validate tradeMetrics before accessing
-    if (!Array.isArray(tradeMetrics) || tradeMetrics.length === 0) {
-      return {
-        currencyId,
-        decision: 'hold',
-        positionType: 'long',
-        confidence: 0.5,
-        reasoning: 'No trade metrics available',
-        entryPrice: 0
-      };
+  async _executeTool(name, input) {
+    switch (name) {
+      case 'get_market_data':
+        return this._toolGetMarketData(input);
+      case 'get_portfolio_status':
+        return this._toolGetPortfolioStatus();
+      case 'open_position':
+        return this._toolOpenPosition(input);
+      case 'close_position':
+        return this._toolClosePosition(input);
+      default:
+        return { error: `Unknown tool: ${name}` };
     }
-    
-    const latestMetric = tradeMetrics[tradeMetrics.length - 1];
-    
-    if (!latestMetric || !latestMetric.Price) {
-      return {
-        currencyId,
-        decision: 'hold',
-        positionType: 'long',
-        confidence: 0.5,
-        reasoning: 'Insufficient market data',
-        entryPrice: 0
-      };
+  }
+
+  /**
+   * Tool: Fetch market data from Bitquery
+   */
+  async _toolGetMarketData({ pair, hours_ago = 24 }) {
+    try {
+      const data = await this.bitqueryClient.getMarketData(pair, hours_ago);
+      return data;
+    } catch (error) {
+      return { error: `Failed to fetch market data for ${pair}: ${error.message}` };
     }
-    
-    const { Price } = latestMetric;
-    const ohlc = Price.Ohlc;
-    const estimate = Price.Average?.Estimate || ohlc.Close;
-    const sma = Price.Average?.WeightedSimpleMoving || estimate;
-    
-    const isPriceAboveSMA = ohlc.Close > sma;
-    const isBullish = ohlc.Close > ohlc.Open;
-    
-    let action = 'hold';
-    let type = 'long';
-    
-    if (isPriceAboveSMA && isBullish) {
-      action = 'open';
-      type = 'long';
-    } else if (!isPriceAboveSMA && !isBullish) {
-      action = 'open';
-      type = 'short';
-    }
-    
+  }
+
+  /**
+   * Tool: Get current portfolio status
+   */
+  _toolGetPortfolioStatus() {
+    const openPositions = Array.from(this.positions.entries()).map(([pair, pos]) => ({
+      pair: `${pair}/USDT`,
+      type: pos.type,
+      entryPrice: pos.entryPrice,
+      size: pos.size,
+      stopLoss: `${((1 - pos.stopLoss) * 100).toFixed(1)}%`,
+      takeProfit: `${((pos.takeProfit - 1) * 100).toFixed(1)}%`,
+      reasoning: pos.reasoning,
+      openedAt: new Date(pos.timestamp).toISOString()
+    }));
+
     return {
-      currencyId,
-      decision: action,
-      positionType: type,
-      confidence: 0.6,
-      reasoning: `Fallback: Price ${isPriceAboveSMA ? 'above' : 'below'} SMA with ${isBullish ? 'bullish' : 'bearish'} candle`,
-      entryPrice: estimate
+      totalCapital: this.capital,
+      allocatedCapital: this.allocatedCapital,
+      availableCapital: this.capital - this.allocatedCapital,
+      openPositions,
+      positionCount: openPositions.length
     };
   }
 
   /**
-   * Open a position based on AI decision
-   * @param {Object} aiDecision - AI decision result
+   * Tool: Open a new position
    */
-  async openPosition(aiDecision) {
-    Logger.info(`Opening ${aiDecision.positionType} position for ${aiDecision.currencyId}`);
-    
-    if (this.allocatedCapital >= this.capital * 0.9) {
-      Logger.warn('Not enough capital to open new position');
-      return null;
+  async _toolOpenPosition({ pair, position_type, reasoning }) {
+    const upperPair = pair.toUpperCase();
+
+    if (this.positions.has(upperPair)) {
+      return { error: `Already have an open position on ${upperPair}/USDT. Close it first.` };
     }
-    
+
+    if (this.allocatedCapital >= this.capital * 0.9) {
+      return { error: 'Not enough capital to open a new position (90% allocated).' };
+    }
+
+    // Fetch current price
+    let entryPrice;
+    try {
+      entryPrice = await this.bitqueryClient.getCurrentPrice(upperPair);
+      if (entryPrice === 0) {
+        return { error: `Could not determine entry price for ${upperPair}/USDT.` };
+      }
+    } catch (error) {
+      return { error: `Failed to fetch price for ${upperPair}: ${error.message}` };
+    }
+
     const positionSize = this.capital * this.riskParams.maxPositionSize;
-    const { network, address } = this.parseCurrencyId(aiDecision.currencyId);
-    
+
     const position = {
       id: `pos_${Date.now()}`,
-      currencyId: aiDecision.currencyId,
-      tokenAddress: address,
-      network,
-      type: aiDecision.positionType,
-      entryPrice: aiDecision.entryPrice,
+      pair: upperPair,
+      type: position_type,
+      entryPrice,
       size: positionSize,
       timestamp: Date.now(),
       stopLoss: this.riskParams.stopLoss,
       takeProfit: this.riskParams.takeProfit,
-      confidence: aiDecision.confidence,
-      reasoning: aiDecision.reasoning,
-      expectedProfit: this.calculateExpectedProfit(positionSize, aiDecision.entryPrice, this.riskParams.takeProfit)
+      reasoning
     };
-    
-    this.positions.set(address, position);
+
+    this.positions.set(upperPair, position);
     this.allocatedCapital += positionSize;
-    
-    Logger.info(`Position opened: ${position.id}`);
-    return position;
+
+    const action = position_type === 'long' ? '📈' : '📉';
+    console.log(`\n${action} Opened ${position_type.toUpperCase()} position on ${upperPair}/USDT at $${entryPrice.toFixed(2)} | Size: $${positionSize.toFixed(2)}`);
+
+    return {
+      success: true,
+      position: {
+        pair: `${upperPair}/USDT`,
+        type: position_type,
+        entryPrice,
+        size: positionSize,
+        stopLoss: `${((1 - this.riskParams.stopLoss) * 100).toFixed(1)}%`,
+        takeProfit: `${((this.riskParams.takeProfit - 1) * 100).toFixed(1)}%`
+      },
+      remainingCapital: this.capital - this.allocatedCapital
+    };
   }
 
   /**
-   * Close a position with P&L calculation
-   * @param {Object} position - Position to close
-   * @param {number} currentPrice - Current market price
+   * Tool: Close an existing position
    */
-  async closePosition(position, currentPrice) {
-    Logger.info(`Closing ${position.type} position for ${position.currencyId}`);
-    
-    // Calculate P&L
-    let pnl = 0;
+  async _toolClosePosition({ pair, reasoning }) {
+    const upperPair = pair.toUpperCase();
+    const position = this.positions.get(upperPair);
+
+    if (!position) {
+      return { error: `No open position on ${upperPair}/USDT.` };
+    }
+
+    // Fetch current price for P&L calculation
+    let currentPrice;
+    try {
+      currentPrice = await this.bitqueryClient.getCurrentPrice(upperPair);
+      if (currentPrice === 0) currentPrice = position.entryPrice;
+    } catch {
+      currentPrice = position.entryPrice;
+    }
+
+    let pnl;
     if (position.type === 'long') {
       pnl = ((currentPrice - position.entryPrice) / position.entryPrice) * position.size;
     } else {
       pnl = ((position.entryPrice - currentPrice) / position.entryPrice) * position.size;
     }
-    
-    this.positions.delete(position.tokenAddress);
+
+    this.positions.delete(upperPair);
     this.allocatedCapital -= position.size;
-    
-    Logger.info(`Position closed: ${position.id} with P&L: $${pnl.toFixed(2)}`);
-    return { ...position, currentPrice, pnl };
-  }
 
-  /**
-   * Parse currency ID to extract network and address
-   * @param {string} currencyId - Currency ID from Bitquery
-   */
-  parseCurrencyId(currencyId) {
-    const parts = currencyId.split(':');
-    
-    if (parts.length === 3) {
-      return { network: parts[1], address: parts[2] };
-    } else if (parts.length === 2) {
-      return { network: 'ethereum', address: parts[1] };
-    } else {
-      return { network: 'unknown', address: currencyId };
-    }
-  }
+    const emoji = pnl >= 0 ? '💰' : '💸';
+    const label = pnl >= 0 ? 'profit' : 'loss';
+    console.log(`\n${emoji} Closed ${position.type.toUpperCase()} on ${upperPair}/USDT | P&L: $${Math.abs(pnl).toFixed(2)} (${label})`);
 
-  /**
-   * Calculate expected profit based on position
-   */
-  calculateExpectedProfit(positionSize, entryPrice, takeProfitMultiplier) {
-    return positionSize * (takeProfitMultiplier - 1);
+    return {
+      success: true,
+      pair: `${upperPair}/USDT`,
+      type: position.type,
+      entryPrice: position.entryPrice,
+      exitPrice: currentPrice,
+      pnl,
+      reasoning
+    };
   }
 
   /**
    * Get all open positions
-   * @returns {Array} Array of position objects
    */
   getOpenPositions() {
     return Array.from(this.positions.values());
@@ -404,95 +385,42 @@ ${prompt}`
 
   /**
    * Close all open positions (used for graceful shutdown)
-   * @param {Object} bitqueryClient - Optional Bitquery client to fetch current prices
-   * @returns {Promise<Object>} Summary of closed positions with total P&L
    */
-  async closeAllPositions(bitqueryClient = null) {
+  async closeAllPositions() {
     const positions = this.getOpenPositions();
-    
+
     if (positions.length === 0) {
-      return {
-        closedCount: 0,
-        totalPnL: 0,
-        positions: []
-      };
+      return { closedCount: 0, totalPnL: 0, positions: [] };
     }
 
     const closedPositions = [];
     let totalPnL = 0;
 
-    Logger.info(`Closing ${positions.length} open position(s)...`);
-
     for (const position of positions) {
-      try {
-        let currentPrice = position.entryPrice; // Default to entry price
-        
-        // Try to fetch current price if Bitquery client is available
-        if (bitqueryClient) {
-          try {
-            const metrics = await bitqueryClient.getTradeMetrics(position.currencyId, 1);
-            if (Array.isArray(metrics) && metrics.length > 0) {
-              const latestMetric = metrics[metrics.length - 1];
-              currentPrice = latestMetric?.Price?.Average?.Estimate || 
-                           latestMetric?.Price?.Ohlc?.Close || 
-                           position.entryPrice;
-            }
-          } catch (error) {
-            Logger.warn(`Could not fetch current price for ${position.currencyId}, using entry price`);
-          }
+      let currentPrice = position.entryPrice;
+
+      if (this.bitqueryClient) {
+        try {
+          currentPrice = await this.bitqueryClient.getCurrentPrice(position.pair);
+          if (currentPrice === 0) currentPrice = position.entryPrice;
+        } catch {
+          Logger.warn(`Could not fetch current price for ${position.pair}, using entry price`);
         }
-        
-        const closedPosition = await this.closePosition(position, currentPrice);
-        closedPositions.push(closedPosition);
-        totalPnL += closedPosition.pnl;
-      } catch (error) {
-        Logger.error(`Error closing position ${position.id}: ${error.message}`);
       }
+
+      let pnl;
+      if (position.type === 'long') {
+        pnl = ((currentPrice - position.entryPrice) / position.entryPrice) * position.size;
+      } else {
+        pnl = ((position.entryPrice - currentPrice) / position.entryPrice) * position.size;
+      }
+
+      this.positions.delete(position.pair);
+      this.allocatedCapital -= position.size;
+      closedPositions.push({ ...position, currentPrice, pnl });
+      totalPnL += pnl;
     }
 
-    return {
-      closedCount: closedPositions.length,
-      totalPnL,
-      positions: closedPositions
-    };
-  }
-
-  /**
-   * Execute AI decision and generate terminal message
-   * @param {Object} aiDecision - AI decision result
-   * @param {Object} tradingParams - Current trading parameters
-   */
-  async executeDecision(aiDecision, tradingParams) {
-    const { currencyId, decision, positionType, confidence, reasoning, entryPrice } = aiDecision;
-    
-    // Get currency display name
-    const { network, address } = this.parseCurrencyId(currencyId);
-    const shortAddress = address.substring(0, 10) + '...' + address.slice(-6);
-    const displayName = `${network}/${shortAddress}`;
-    
-    let message = '';
-    
-    if (decision === 'open') {
-      // Open position
-      const position = await this.openPosition(aiDecision);
-      if (position) {
-        message = `\n📈 Opening ${positionType} position for ${displayName} with expected profit of $${position.expectedProfit.toFixed(2)}`;
-      }
-    } else if (decision === 'close') {
-      // Close position
-      const position = this.positions.get(address);
-      if (position) {
-        const closedPosition = await this.closePosition(position, entryPrice);
-        const profitOrLoss = closedPosition.pnl >= 0 ? 'profit' : 'loss';
-        const amount = Math.abs(closedPosition.pnl).toFixed(2);
-        message = `\n📉 Closing ${positionType} position for ${displayName} for ${profitOrLoss} of $${amount}`;
-      }
-    } else {
-      // Hold
-      message = `\n⏸️  Holding position for ${displayName}`;
-    }
-    
-    return { message, decision, currencyId: displayName };
+    return { closedCount: closedPositions.length, totalPnL, positions: closedPositions };
   }
 }
-
